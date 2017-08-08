@@ -10,6 +10,7 @@ dependencies:
 - ipython
 - ipyparallel
 - jupyter
+- cython
 - pip:
   - ema_workbench
   - salib
