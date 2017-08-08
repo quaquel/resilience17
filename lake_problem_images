@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jul  7 10:44:32 2017
+
+UPDATED 7/31/2017 to improve aesthetics, change figure to show only the naive
+guesses and non-dominated points after each number of generations, and add a 
+secondary, parallel set of figures that uses the actual Lake Problem objective
+labels rather than generic objectie names.
+
+@author: Caitlin Spence
+"""
+
+#import os
+import math
+import numpy as np
+import matplotlib as mpl
+from scipy.optimize import brentq as root
+from rhodium import *
+from rhodium.config import RhodiumConfig
+from platypus import MapEvaluator
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
+from mpl_toolkits.mplot3d import proj3d
+
+RhodiumConfig.default_evaluator = MapEvaluator()
+
+#------------------------------------------------------------------------------
+# Pareto sorting functions
+#------------------------------------------------------------------------------
+
+# Pareto dominance function adapted from http://code.activestate.com/recipes/578287-multidimensional-pareto-front/
+def dominates(row, rowCandidate):
+    return (row[0] >= rowCandidate[0]) and (row[1] <= rowCandidate[1]) and (row[2] >= rowCandidate[2])
+
+def cull(pts, dominates):
+    dominated = list()
+    cleared = list()
+    for k in range(len(pts)):
+        point = pts[k]
+        doms = 0
+        for j in range(len(pts)):
+            if dominates(pts[j], point): 
+                doms = doms + 1 # How many other points dominate our point?
+                if dominates(point, pts[j]): doms = doms - 1    # Subtract if our point also dominates this point (they are the same)
+        # If no other points dominate our point, add the point to the list of non-dominated points.
+        if doms == 0: 
+            cleared.append(point)
+        # If at least one point dominates our point, add this point to the "dominated" list.
+        elif doms > 0: 
+            dominated.append(point)
+        doms = 0
+    return(cleared, dominated)
+
+def pareto_sort(uti, pho, rel, dominates):
+    output_points = np.column_stack((np.asarray(uti), np.asarray(pho), np.asarray(rel)))
+    output_pts = list()
+    for k in range(len(uti)):
+        output_pts.append(output_points[k,:])
+    
+    (dominant, dominated) = cull(output_pts, dominates)
+    dominant = np.asarray(dominant)
+    dominated = np.asarray(dominated)
+
+    uti_dominant = dominant[:,0]
+    pho_dominant = dominant[:,1]
+    rel_dominant = dominant[:,2]
+
+    uti_dominated = dominated[:,0]
+    pho_dominated = dominated[:,1]
+    rel_dominated = dominated[:,2]
+    
+    return(uti_dominant, pho_dominant, rel_dominant, uti_dominated, pho_dominated, rel_dominated)
+
+class Arrow3D(FancyArrowPatch):
+    def __init__(self, xs, ys, zs, *args, **kwargs):
+        FancyArrowPatch.__init__(self, (0,0), (0,0), *args, **kwargs)
+        self._verts3d = xs, ys, zs
+
+    def draw(self, renderer):
+        xs3d, ys3d, zs3d = self._verts3d
+        xs, ys, zs = proj3d.proj_transform(xs3d, ys3d, zs3d, renderer.M)
+        self.set_positions((xs[0],ys[0]),(xs[1],ys[1]))
+        FancyArrowPatch.draw(self, renderer)
+
+#------------------------------------------------------------------------------
+# Set up the Lake Problem as a Rhodium model
+#------------------------------------------------------------------------------
+
+def lake_problem_t(pollution_limit,
+         b = 0.42,        # decay rate for P in lake (0.42 = irreversible)
+         q = 2.0,         # recycling exponent
+         mean = 0.02,     # mean of natural inflows
+         stdev = 0.001,   # standard deviation of natural inflows
+         alpha = 0.4,     # utility from pollution
+         delta = 0.98,    # future utility discount rate
+         nsamples = 100): # monte carlo sampling of natural inflows)
+    Pcrit = root(lambda x: x**q/(1+x**q) - b*x, 0.01, 1.5)
+    nvars = len(pollution_limit)
+    X = np.zeros((nvars,))
+    average_daily_P = np.zeros((nvars,))
+    decisions = np.array(pollution_limit)
+    reliability = 0.0
+
+    for _ in range(nsamples):
+        X[0] = 0.0
+        
+        natural_inflows = np.random.lognormal(
+                math.log(mean**2 / math.sqrt(stdev**2 + mean**2)),
+                math.sqrt(math.log(1.0 + stdev**2 / mean**2)),
+                size = nvars)
+        
+        for t in range(1,nvars):
+            X[t] = (1-b)*X[t-1] + X[t-1]**q/(1+X[t-1]**q) + decisions[t-1] + natural_inflows[t-1]
+            average_daily_P[t] += X[t]/float(nsamples)
+    
+        reliability += np.sum(X < Pcrit)/float(nsamples*nvars)
+      
+    max_P = np.max(average_daily_P)
+    utility = np.sum(alpha*decisions*np.power(delta,np.arange(nvars)))
+    # intertia = np.sum(np.diff(decisions) > -0.02)/float(nvars-1)
+    
+    return (max_P, utility, reliability)
+
+# name the model "model3" for three objectives"
+model3 = Model(lake_problem_t)
+
+# define all parameters to the model that we will be studying
+model3.parameters = [Parameter("pollution_limit"),
+                    Parameter("b"),
+                    Parameter("q"),
+                    Parameter("mean"),
+                    Parameter("stdev"),
+                    Parameter("delta")]
+
+# define the model outputs
+model3.responses = [Response("max_P", Response.MINIMIZE),
+                   Response("utility", Response.MAXIMIZE),
+                   Response("reliability", Response.MAXIMIZE)]
+
+# define any constraints (can reference any parameter or response by name)
+#model3.constraints = [Constraint("reliability >= 0.80")]
+
+# some parameters are levers that we control via our policy
+model3.levers = [RealLever("pollution_limit", 0.0, 0.1, length=100)]
+
+# some parameters are exogeneous uncertainties, and we want to better
+# understand how these uncertainties impact our model and decision making
+# process
+model3.uncertainties = [UniformUncertainty("b", 0.1, 0.45),
+                       UniformUncertainty("q", 2.0, 4.5),
+                       UniformUncertainty("mean", 0.01, 0.05),
+                       UniformUncertainty("stdev", 0.001, 0.005),
+                       UniformUncertainty("delta", 0.93, 0.99)]
+
+
+
+# Random discharge sequences < 0.01
+pollution_decisions = np.random.uniform(0, 0.1, size=(100,100))
+
+pho_naive = np.empty((100,1))
+uti_naive = np.empty((100,1))
+rel_naive = np.empty((100,1))
+
+for k in range(len(pollution_decisions)):
+    (pho_naive[k], uti_naive[k], rel_naive[k]) = lake_problem_t(pollution_decisions[k,:])
+    
+# Sort dominant from dominated
+(uti_dominant, pho_dominant, rel_dominant, uti_dominated, pho_dominated, rel_dominated) = pareto_sort(uti_naive,
+            pho_naive,
+            rel_naive,
+            dominates)    
+
+# The numbers for optimization
+genind = np.linspace(1, 10001, num=201)
+#------------------------------------------------------------------------------
+# Set default values used in plotting
+#------------------------------------------------------------------------------
+
+# Use Seaborn settings for pretty plots
+sns.set_style("white")
+
+## Find a prettier yellow (for the stars)
+#cmap = plt.get_cmap('viridis')
+#yellow = cmap(20)
+#
+#cmap2 = plt.get_cmap('PuRd')
+#pink = cmap2(175)
+
+# viewing angle
+angle = 120
+
+trans_value = 0.6
+cmap = plt.get_cmap('plasma')
+norm = mpl.colors.Normalize(vmin=np.min(genind), vmax=np.max(genind))
+
+gens_cmap = mpl.cm.plasma
+gens_smap = mpl.cm.ScalarMappable(cmap=gens_cmap, norm=norm)
+gens_smap.set_array([])
+
+# heart = marker for ideal point
+#heart = r'$\heartsuit$'
+heart = '*'
+
+# font sizes
+fs = 20
+fs2 = 16
+
+# Axes limits
+utilims = (0, 2.6)
+pholims = (0, 2.3)
+rellims = (0, 1.1)
+
+
+#------------------------------------------------------------------------------
+# Generate 3D plots
+#------------------------------------------------------------------------------
+
+
+# Empty space
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.view_init(elev=20, azim=angle)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_0.png', figsize=(9,6), dpi=150)
+fig.savefig('Fig_Lakeprob_0.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Add objective A and direction of preference
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+#a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 20, lw=2, arrowstyle="-|>", color="k")
+#a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 20, lw=2, arrowstyle="-|>", color="k")
+ax.view_init(elev=20, azim=angle)
+ax.add_artist(a1)
+#ax.add_artist(a2)
+#ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_1.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Lake problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+#a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 20, lw=2, arrowstyle="-|>", color="k")
+#a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 20, lw=2, arrowstyle="-|>", color="k")
+ax.view_init(elev=20, azim=angle)
+ax.add_artist(a1)
+#ax.add_artist(a2)
+#ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_1.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Add objective B and direction of preference
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+#a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.view_init(elev=20, azim=angle)
+ax.add_artist(a1)
+ax.add_artist(a2)
+#ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_2.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Lake problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+#a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.view_init(elev=20, azim=angle)
+ax.add_artist(a1)
+ax.add_artist(a2)
+#ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_2.png', figsize=(9,6), dpi=150)
+plt.show()
+
+
+# Add objective C and direction of preference
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_title('C', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_3.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Lake problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_title('Reliability', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_3.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Add the ideal point
+
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+# Cast a shadow
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_title('C', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_4.png', figsize=(9,6), dpi=150)
+plt.show()
+
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+# Cast a shadow
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30,lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_title('Reliability', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_4.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Add a single alternative
+
+x = 5   # Index of the random alternative
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+ax.scatter(uti_naive[x], pho_naive[x], rel_naive[x], alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.5, s=35)
+ax.scatter(uti_naive[x], pho_naive[x], 0, color='k', alpha=0.2)
+ax.scatter(uti_naive[x], 0, rel_naive[x], color='k', alpha=0.2)
+ax.scatter(2.6, pho_naive[x], rel_naive[x], color='k', alpha=0.2)
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_zlabel('C', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_5.png', figsize=(9,6), dpi=150)
+plt.show()
+
+
+# Lake Problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+ax.scatter(uti_naive[x], pho_naive[x], rel_naive[x], alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+ax.scatter(uti_naive[x], pho_naive[x], 0, color='k', alpha=0.2)
+ax.scatter(uti_naive[x], 0, rel_naive[x], color='k', alpha=0.2)
+ax.scatter(2.6, pho_naive[x], rel_naive[x], color='k', alpha=0.2)
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_title('Reliability', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_5.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# add cloud of naive guesses
+
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.scatter(uti_naive, pho_naive, rel_naive, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+# Ideal point
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+# A-B plane
+ax.scatter(uti_naive, pho_naive, np.full(rel_naive.shape, 0), color='k', alpha=0.05)
+# A-C plane
+ax.scatter(uti_naive, np.full(pho_naive.shape, 0), rel_naive, color='k', alpha=0.05)
+# B-C plane
+ax.scatter(np.full(uti_naive.shape, 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_title('C', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_6.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Lake problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+n = 100
+ax.scatter(uti_naive, pho_naive, rel_naive, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+# Ideal point
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+# A-B plane
+ax.scatter(uti_naive, pho_naive, np.full(rel_naive.shape, 0), color='k', alpha=0.05)
+# A-C plane
+ax.scatter(uti_naive, np.full(pho_naive.shape, 0), rel_naive, color='k', alpha=0.05)
+# B-C plane
+ax.scatter(np.full(uti_naive.shape, 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_title('Reliability', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_6.png', figsize=(9,6), dpi=150)
+plt.show()
+
+
+# Highlight the non-dominated points
+# Generic
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.scatter(uti_dominant, pho_dominant, rel_dominant, alpha=trans_value, c = plt.cm.plasma(3/4), lw = 0.2, s=35)
+ax.scatter(uti_dominated, pho_dominated, rel_dominated, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+# A-B plane
+ax.scatter(uti_naive, pho_naive, np.full(rel_naive.shape, 0), color='k', alpha=0.05)
+# A-C plane
+ax.scatter(uti_naive, np.full(pho_naive.shape, 0), rel_naive, color='k', alpha=0.05)
+# B-C plane
+ax.scatter(np.full(uti_naive.shape, 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('A', fontsize=fs)
+ax.set_ylabel('B', fontsize=fs)
+ax.set_title('C', fontsize=fs)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Stockholm_7.png', figsize=(9,6), dpi=150)
+plt.show()
+
+# Lake problem
+fig = plt.figure(figsize=(9,6), dpi=150)
+ax = fig.add_subplot(111, projection='3d')
+ax.scatter(uti_dominant, pho_dominant, rel_dominant, alpha=trans_value, c = plt.cm.plasma(3/4), lw = 0.2, s=35)
+ax.scatter(uti_dominated, pho_dominated, rel_dominated, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+#ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+# A-B plane
+ax.scatter(uti_naive, pho_naive, np.full(rel_naive.shape, 0), color='k', alpha=0.05)
+# A-C plane
+ax.scatter(uti_naive, np.full(pho_naive.shape, 0), rel_naive, color='k', alpha=0.05)
+# B-C plane
+ax.scatter(np.full(uti_naive.shape, 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+ax.view_init(elev=20, azim=angle)
+a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+ax.add_artist(a1)
+ax.add_artist(a2)
+ax.add_artist(a3)
+ax.set_xlabel('Economic Benefits', fontsize=fs2)
+ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+ax.set_title('Reliability', fontsize=fs2)
+ax.set_xlim(utilims)
+ax.set_ylim(pholims)
+ax.set_zlim(rellims)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.set_zticks([])
+fig.savefig('Fig_Lakeprob_7.png', figsize=(9,6), dpi=150)
+plt.show()
+
+
+
+#------------------------------------------------------------------------------
+# Loop to generate the images for animation
+#------------------------------------------------------------------------------
+
+# Initialize list for optimized output
+output_uti3 = list(uti_naive)
+output_pho3 = list(pho_naive)
+output_rel3 = list(rel_naive)
+
+# Loop that performs optimization and generates .png images.
+for i in range(len(genind)):
+    k = genind[i]
+    # Name model according to number of generations
+    if k < 10:
+        nameS3 = 'Fig_Stockholm_allanim_8_000' + str(k) + '.png'
+        nameS23 = 'Fig_Stockholm_anim_8_000' + str(k) + '.png'
+        nameL3 = 'Fig_Lakeprob_anim_8_000' + str(k) + '.png'
+    elif k < 100:
+        nameS3 = 'Fig_Stockholm_allanim_8_00' + str(k) + '.png'
+        nameS23 = 'Fig_Stockholm_anim_8_00' + str(k) + '.png'
+        nameL3 = 'Fig_Lakeprob_anim_8_00' + str(k) + '.png'
+    elif k < 1000:
+        nameS3 = 'Fig_Stockholm_allanim_8_0' + str(k) + '.png'
+        nameS23 = 'Fig_Stockholm_anim_8_0' + str(k) + '.png'
+        nameL3 = 'Fig_Lakeprob_anim_8_0' + str(k) + '.png'
+    else:
+        nameS3 = 'Fig_Stockholm_allanim_8_' + str(k) + '.png'
+        nameS23 = 'Fig_Stockholm_anim_8_' + str(k) + '.png'
+        nameL3 = 'Fig_Lakeprob_anim_8_' + str(k) + '.png'
+        
+    # Perform optimization for specified number of generations
+    name_output3 = optimize(model3, "NSGAII", int(k))
+    
+    # Add optimized output to the list
+    output_uti3.extend(name_output3['utility'])
+    output_pho3.extend(name_output3['max_P'])
+    output_rel3.extend(name_output3['reliability'])
+    
+    # Re-check the list for dominant points
+    (uti_dominant, pho_dominant, rel_dominant, uti_dominated, pho_dominated, rel_dominated) = pareto_sort(output_uti3,
+            output_pho3,
+            output_rel3,
+            dominates)
+       
+    
+    # Generic image: Dominant points in orange and dominated points in deep purple.
+    fig = plt.figure(figsize=(9,6), dpi=150)
+    ax = fig.add_subplot(111, projection='3d')   
+    '''Plot the results'''
+    # Plot non-dominated points
+    ax.scatter(uti_dominant, pho_dominant, rel_dominant, alpha=trans_value, c = plt.cm.plasma(3/4), lw = 0.2, s=35)
+    # Plot dominated points
+    ax.scatter(uti_dominated, pho_dominated, rel_dominated, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+    # plot the points' shadows
+    # A-B plane
+    ax.scatter(output_uti3, output_pho3, np.full(len(output_rel3), 0), color='k', alpha=0.05)
+    # A-C plane
+    ax.scatter(output_uti3, np.full(len(output_pho3), 0), output_rel3, color='k', alpha=0.05)
+    # B-C plane
+    ax.scatter(np.full(len(output_uti3), 2.6), output_pho3, output_rel3, color='k', alpha=0.05)
+    ''' Set up the rest of the figure's architecture'''
+    # Heart for ideal point
+    ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+    # Shadow of ideal point
+    #ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+    ax.view_init(elev=20, azim=angle)
+    #Arrows showing direction of preference
+    a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    ax.add_artist(a1)
+    ax.add_artist(a2)
+    ax.add_artist(a3)
+    # Axes labels
+    ax.set_xlabel('A', fontsize=fs)
+    ax.set_ylabel('B', fontsize=fs)
+    ax.set_title('C', fontsize=fs)
+    # Set up axes limits
+    ax.set_xlim(utilims)
+    ax.set_ylim(pholims)
+    ax.set_zlim(rellims)
+    # Remove ticks to clean up the figure
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_zticks([])
+    fig.savefig(nameS3)
+    plt.clf()
+    
+    #Generic image with dominant points in orange and naive guesses in purple.
+    fig = plt.figure(figsize=(9,6), dpi=150)
+    ax = fig.add_subplot(111, projection='3d')   
+    '''Plot the results'''
+    # Plot non-dominated points
+    ax.scatter(uti_dominant, pho_dominant, rel_dominant, alpha=trans_value, c = plt.cm.plasma(3/4), lw = 0.2, s=35)
+    ax.scatter(uti_naive, pho_naive, rel_naive, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+    # plot the points' shadows
+    # A-B plane
+    ax.scatter(uti_dominant, pho_dominant, np.full(len(rel_dominant), 0), color='k', alpha=0.05)
+    ax.scatter(uti_naive, pho_naive, np.full(len(rel_naive), 0), color='k', alpha=0.05)
+    # A-C plane
+    ax.scatter(uti_dominant, np.full(len(pho_dominant), 0), rel_dominant, color='k', alpha=0.05)
+    ax.scatter(uti_naive, np.full(len(pho_naive), 0), rel_naive, color='k', alpha=0.05)
+    # B-C plane
+    ax.scatter(np.full(len(uti_dominant), 2.6), pho_dominant, rel_dominant, color='k', alpha=0.05)
+    ax.scatter(np.full(len(uti_naive), 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+    ''' Set up the rest of the figure's architecture'''
+    # Heart for ideal point
+    ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+    # Shadow of ideal point
+    #ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+    ax.view_init(elev=20, azim=angle)
+    #Arrows showing direction of preference
+    a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    ax.add_artist(a1)
+    ax.add_artist(a2)
+    ax.add_artist(a3)
+    # Axes labels
+    ax.set_xlabel('A', fontsize=fs)
+    ax.set_ylabel('B', fontsize=fs)
+    ax.set_title('C', fontsize=fs)
+    # Set up axes limits
+    ax.set_xlim(utilims)
+    ax.set_ylim(pholims)
+    ax.set_zlim(rellims)
+    # Remove ticks to clean up the figure
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_zticks([])
+    fig.savefig(nameS23)
+    plt.clf()
+    
+    #Lake problem igure with dominant points and naive guesses
+    fig = plt.figure(figsize=(9,6), dpi=150)
+    ax = fig.add_subplot(111, projection='3d')   
+    '''Plot the results'''
+    # Plot non-dominated points
+    ax.scatter(uti_dominant, pho_dominant, rel_dominant, alpha=trans_value, c = plt.cm.plasma(3/4), lw = 0.2, s=35)
+    ax.scatter(uti_naive, pho_naive, rel_naive, alpha=trans_value, c = plt.cm.plasma(0/4), lw = 0.2, s=35)
+    # plot the points' shadows
+    # A-B plane
+    ax.scatter(uti_dominant, pho_dominant, np.full(len(rel_dominant), 0), color='k', alpha=0.05)
+    ax.scatter(uti_naive, pho_naive, np.full(len(rel_naive), 0), color='k', alpha=0.05)
+    # A-C plane
+    ax.scatter(uti_dominant, np.full(len(pho_dominant), 0), rel_dominant, color='k', alpha=0.05)
+    ax.scatter(uti_naive, np.full(len(pho_naive), 0), rel_naive, color='k', alpha=0.05)
+    # B-C plane
+    ax.scatter(np.full(len(uti_dominant), 2.6), pho_dominant, rel_dominant, color='k', alpha=0.05)
+    ax.scatter(np.full(len(uti_naive), 2.6), pho_naive, rel_naive, color='k', alpha=0.05)
+    ''' Set up the rest of the figure's architecture'''
+    # Heart for ideal point
+    ax.plot([2.6,10], [0.0,10], [0.95,10], marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,linestyle='None')
+    # Shadow of ideal point
+    #ax.plot((2.5,2.5,0), (0,2.3,0), (0,1.0,1.0), marker=heart, color='k', markersize=15, markeredgecolor='k', markeredgewidth=1,alpha=0.2,linestyle='None')
+    ax.view_init(elev=20, azim=angle)
+    #Arrows showing direction of preference
+    a1 = Arrow3D([0, 2.6], [0, 0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a2 = Arrow3D([2.6, 2.6], [2.3 ,0], [0, 0], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    a3 = Arrow3D([2.6, 2.6], [0, 0], [0, 1.1], mutation_scale = 30, lw=2, arrowstyle="-|>", color="k")
+    ax.add_artist(a1)
+    ax.add_artist(a2)
+    ax.add_artist(a3)
+    # Axes labels
+    ax.set_xlabel('Economic Benefits', fontsize=fs2)
+    ax.set_ylabel('Phosphorous Concentration', fontsize=fs2)
+    ax.set_title('Reliability', fontsize=fs2)
+    # Set up axes limits
+    ax.set_xlim(utilims)
+    ax.set_ylim(pholims)
+    ax.set_zlim(rellims)
+    # Remove ticks to clean up the figure
+    ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_zticks([])
+    fig.savefig(nameL3)
+    plt.clf()
+
+
+
